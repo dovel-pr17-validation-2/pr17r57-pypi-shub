@@ -1,0 +1,816 @@
+import json
+import os
+import re
+import stat
+import sys
+import textwrap
+import unittest
+import zipfile
+from collections import deque
+from io import StringIO
+from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
+
+import click
+import pytest
+import requests
+import yaml
+from click.testing import CliRunner
+from scrapinghub import ScrapinghubAPIError
+
+from shub import utils
+from shub.config import ShubConfig
+from shub.exceptions import (
+    BadParameterException,
+    InvalidAuthException,
+    MissingAuthException,
+    NotFoundException,
+    RemoteErrorException,
+    SubcommandException,
+)
+
+from .utils import AssertInvokeRaisesMixin, mock_conf
+
+# What the (mocked) stack lookup returns in the wizard tests
+LATEST_STACK = "scrapy:2.99-20990101"
+
+
+def _tags_response(names, next_url=None):
+    """Mock a page of GitHub's list of repository tags."""
+    response = Mock()
+    response.json.return_value = [{"name": name} for name in names]
+    response.links = {"next": {"url": next_url}} if next_url else {}
+    return response
+
+
+def _stack_release(stack):
+    """Return a date-frozen stack, e.g. scrapy:2.18-20260824, as a
+    (major, minor, date) tuple, so that stacks can be compared."""
+    major, minor, date = re.fullmatch(r"scrapy:(\d+)\.(\d+)-(\d{8})", stack).groups()
+    return int(major), int(minor), date
+
+
+class UtilsTest(AssertInvokeRaisesMixin, unittest.TestCase):
+    def setUp(self):
+        self.runner = CliRunner()
+
+    def test_run_cmd_captures_stderr(self):
+        cmd = [
+            "python",
+            "-c",
+            # The next two lines are ONE list element (no comma)
+            (
+                "from __future__ import print_function; import sys; "
+                'print("Hello", file=sys.stderr)'
+            ),
+        ]
+        assert utils.run_cmd(cmd) == ""
+        cmd[-1] += "; sys.exit(99)"
+        with pytest.raises(SubcommandException, match=r"STDERR[\s-]+Hello"):
+            utils.run_cmd(cmd)
+
+    def test_pwd_git_version_without_git(self):
+        # Change into test dir to make sure we're within a repo
+        os.chdir(Path(__file__).parent)
+        assert utils.pwd_git_version() is not None
+        with patch("shub.utils.which", return_value=None):
+            assert utils.pwd_git_version() is None
+
+    @patch("shub.utils.which", return_value="vcs")
+    @patch("shub.utils.run_cmd", side_effect=["1a2b3c", "user/feature"])
+    def test_pwd_git_version_clean(self, mock_run_cmd, mock_which):
+        assert utils.pwd_git_version() == "1a2b3c-userfeature"
+
+    @patch("shub.utils.which", return_value="vcs")
+    @patch("shub.utils.run_cmd", side_effect=["42", "user/feature"])
+    def test_pwd_hg_version_clean(self, mock_run_cmd, mock_which):
+        assert utils.pwd_hg_version() == "r42-userfeature"
+
+    @patch("shub.utils.pwd_git_version", return_value="ver_GIT")
+    @patch("shub.utils.pwd_hg_version", return_value="ver_HG")
+    @patch("shub.utils.pwd_bzr_version", return_value="ver_BZR")
+    @patch("shub.utils.time.time", return_value=101)
+    def test_pwd_version(self, mock_time, mock_bzr, mock_hg, mock_git):
+        assert utils.pwd_version() == "ver_GIT"
+        mock_git.return_value = None
+        assert utils.pwd_version() == "ver_HG"
+        mock_hg.return_value = None
+        assert utils.pwd_version() == "ver_BZR"
+        mock_bzr.return_value = None
+        with self.runner.isolated_filesystem():
+            with Path("setup.py").open("w") as f:
+                f.write("from setuptools import setup\n")
+                f.write("setup(version='1.0')")
+            assert utils.pwd_version() == "1.0"
+            setup_version = (
+                "Building lxml version 3.4.4."
+                "\nBuilding without Cython."
+                "\nUsing build configuration of libxslt 1.1.28"
+                "\n3.4.4"
+            )
+            with patch("shub.utils.run_python", return_value=setup_version):
+                assert utils.pwd_version() == "3.4.4"
+            Path("subdir").mkdir()
+            os.chdir("subdir")
+            assert utils.pwd_version() == "101"
+            Path("../scrapy.cfg").touch()
+            assert utils.pwd_version() == "1.0"
+
+    @patch("shub.utils.pwd_git_version")
+    def test_pwd_version_clean(self, mock_git):
+        mock_git.return_value = "vers_1"
+        assert utils.pwd_version() == "vers_1"
+        mock_git.return_value = "ve  rs _ 2"
+        assert utils.pwd_version() == "vers_2"
+        mock_git.return_value = "vers -3_1:1"
+        assert utils.pwd_version() == "vers-3_11"
+        mock_git.return_value = "vers -4_1!$@%#&$()2"
+        assert utils.pwd_version() == "vers-4_12"
+
+    def test_get_job_specs(self):
+        conf = mock_conf(self)
+
+        def _test_specs(job, expected_job_id, expected_endpoint):
+            assert utils.get_job_specs(job) == (
+                expected_job_id,
+                conf.get_apikey(expected_endpoint),
+            )
+
+        _test_specs("10/20/30", "10/20/30", "default")
+        _test_specs("2/3", "1/2/3", "default")
+        _test_specs("default/2/3", "1/2/3", "default")
+        _test_specs("prod/2/3", "2/2/3", "default")
+        _test_specs("vagrant/2/3", "3/2/3", "vagrant")
+        _test_specs(
+            "https://app.zyte.com/p/7389/259/1/#/log/line/0",
+            "7389/259/1",
+            "default",
+        )
+        _test_specs(
+            "https://app.zyte.com/p/7389/job/259/1/",
+            "7389/259/1",
+            "default",
+        )
+
+    def test_get_job_specs_validates_jobid(self):
+        invalid_job_ids = ["/1/1", "123", "1/2/a", "1//"]
+        for job_id in invalid_job_ids:
+            with pytest.raises(BadParameterException):
+                utils.get_job_specs(job_id)
+
+    @patch("shub.utils.ScrapinghubClient", autospec=True)
+    def test_get_job(self, mock_SC):
+        mockjob = mock_SC.return_value.get_job.return_value
+        mockjob.metadata.iter.return_value = iter([("state", "running")])
+        conf = mock_conf(self)
+
+        assert utils.get_job("1/1/1") is mockjob
+        mock_SC.assert_called_once_with(conf.apikeys["default"])
+        assert utils.job_live(mockjob)
+        assert not mockjob.metadata.get.called
+
+        with pytest.raises(BadParameterException):
+            utils.get_job("1/1/")
+
+        # Non-existent job
+        mockjob.metadata.iter.side_effect = StopIteration
+        with pytest.raises(NotFoundException):
+            utils.get_job("1/1/1")
+
+    def test_is_deploy_successful(self):
+        # no results
+        last_logs = deque(maxlen=5)
+        assert not utils._is_deploy_successful(last_logs)
+        # missing or incorrect data
+        last_logs.append("")
+        assert not utils._is_deploy_successful(last_logs)
+        last_logs.append("abcdef")
+        assert not utils._is_deploy_successful(last_logs)
+        last_logs.append('{"field":"wrong"}')
+        assert not utils._is_deploy_successful(last_logs)
+        # error status
+        last_logs.append('{"status":"error"}')
+        assert not utils._is_deploy_successful(last_logs)
+        # successful status
+        last_logs.append('{"status":"ok"}')
+        assert utils._is_deploy_successful(last_logs)
+        last_logs.append('{"field":"value","status":"ok"}')
+        assert utils._is_deploy_successful(last_logs)
+        # more complex python expression
+        last_logs.append(
+            '{"status":"ok", "project": 1111112, '
+            '"version": "1234-master", "spiders": 3}'
+        )
+        assert utils._is_deploy_successful(last_logs)
+
+    def test_job_live(self):
+        job = MagicMock(spec=["metadata"])
+        for live_value in ("pending", "running"):
+            job.metadata.get.return_value = live_value
+            assert utils.job_live(job, refresh_meta_after=-1)
+        for dead_value in ("finished", "deleted"):
+            job.metadata.get.return_value = dead_value
+            assert not utils.job_live(job, refresh_meta_after=-1)
+        job.metadata.get.assert_called_with("state")
+
+    def test_job_live_updates_metadata(self):
+        job = MagicMock(spec=["metadata"])
+        with patch("shub.utils.time.time") as mock_time:
+            mock_time.return_value = 0
+            utils.job_live(job)
+            assert job.metadata.get.call_count == 1
+            mock_time.return_value = 10
+            utils.job_live(job, refresh_meta_after=20)
+            assert job.metadata.get.call_count == 1
+            utils.job_live(job, refresh_meta_after=5)
+            assert job.metadata.get.call_count == 2
+            utils.job_live(job, refresh_meta_after=5)
+            assert job.metadata.get.call_count == 2
+
+    @patch("shub.utils.time.sleep")
+    def test_job_resource_iter(self, mock_sleep):
+        job = MagicMock(spec=["key", "metadata", "resource"])
+        job.key = "jobkey"
+        job.metadata = {"state": "running"}
+
+        def make_items(iterable):
+            return [{"_key": x} for x in iterable]
+
+        def make_lines(iterable):
+            return [json.dumps(x) for x in make_items(iterable)]
+
+        def magic_iter(*args, **kwargs):
+            """
+            Return two different iterators on the first two calls, set job's
+            state to 'finished' after the second call.
+            """
+            if magic_iter.stage == 0:
+                if "startafter" in kwargs:
+                    assert kwargs["startafter"] is None
+                magic_iter.stage = 1
+                return iter(make_items([1, 2, 3]))
+            if magic_iter.stage == 1:
+                assert kwargs["startafter"] == 3
+                magic_iter.stage = 0
+                job._state = "finished"
+                return iter(make_items([4, 5, 6]))
+            if magic_iter.stage == 2:
+                assert kwargs["startafter"] == "jobkey/996"
+                return iter([])
+            return None
+
+        def jri_result(follow, tail=None):
+            return list(
+                utils.job_resource_iter(
+                    job,
+                    job.resource,
+                    follow=follow,
+                    tail=tail,
+                    output_json=True,
+                )
+            )
+
+        job.resource.iter = magic_iter
+
+        magic_iter.stage = 0
+        assert jri_result(False) == make_lines([1, 2, 3])
+        assert not mock_sleep.called
+
+        magic_iter.stage = 0
+        assert jri_result(True) == make_lines([1, 2, 3, 4, 5, 6])
+        assert mock_sleep.called
+
+        magic_iter.stage = 0
+        job._state = "finished"
+        assert jri_result(True) == make_lines([1, 2, 3])
+
+        magic_iter.stage = 2
+        job.resource.stats.return_value = {"totals": {"input_values": 1000}}
+        assert jri_result(True, tail=3) == []
+
+    @patch("shub.utils.requests.get", autospec=True)
+    def test_latest_github_release(self, mock_get):
+        with self.runner.isolated_filesystem():
+            mock_get.return_value.json.return_value = {"key": "value"}
+            assert {"key": "value"}.items() <= utils.latest_github_release(
+                cache="./cache.txt"
+            ).items()
+            mock_get.return_value.json.return_value = {"key": "newvalue"}
+            assert {"key": "value"}.items() <= utils.latest_github_release(
+                cache="./cache.txt"
+            ).items()
+            assert {"key": "newvalue"}.items() <= utils.latest_github_release(
+                force_update=True, cache="./cache.txt"
+            ).items()
+            # Garbage in cache
+            mock_get.return_value.json.return_value = {"key": "value"}
+            with Path("./cache.txt").open("w") as f:
+                f.write("abc")
+            assert {"key": "value"}.items() <= utils.latest_github_release(
+                cache="./cache.txt"
+            ).items()
+            mock_get.return_value.json.return_value = {"key": "newvalue"}
+            assert {"key": "value"}.items() <= utils.latest_github_release(
+                cache="./cache.txt"
+            ).items()
+            # Readonly cache file
+            mock_get.return_value.json.return_value = {"key": "value"}
+            with Path("./cache.txt").open("w") as f:
+                f.write("abc")
+            Path("./cache.txt").chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+            assert {"key": "value"}.items() <= utils.latest_github_release(
+                cache="./cache.txt"
+            ).items()
+            mock_get.return_value.json.return_value = {"key": "newvalue"}
+            assert {"key": "newvalue"}.items() <= utils.latest_github_release(
+                cache="./cache.txt"
+            ).items()
+            with Path("./cache.txt").open() as f:
+                assert f.read() == "abc"
+
+    @patch("shub.utils.latest_github_release", autospec=True)
+    @patch("shub.utils.shub.__version__", new="1.5.0")
+    def test_update_available(self, mock_lgr):
+        class MockException(Exception):
+            pass
+
+        mock_lgr.return_value = {"name": "v1.4.0", "html_url": "link"}
+        assert utils.update_available() is None
+        mock_lgr.return_value["name"] = "v1.5.0"
+        assert utils.update_available() is None
+        mock_lgr.return_value["name"] = "v1.5.1"
+        assert utils.update_available() == "link"
+        mock_lgr.return_value["name"] = "v1.6.1"
+        assert utils.update_available() == "link"
+        mock_lgr.return_value["name"] = "v2.0.0"
+        assert utils.update_available() == "link"
+        mock_lgr.return_value = {"error": "unavailable"}
+        assert utils.update_available() is None
+        mock_lgr.return_value = None
+        assert utils.update_available() is None
+        mock_lgr.side_effect = MockException
+        assert utils.update_available() is None
+        with pytest.raises(MockException):
+            utils.update_available(silent_fail=False)
+
+    @patch("shub.utils.requests.get", autospec=True)
+    def test_get_latest_scrapy_stack(self, mock_get):
+        mock_get.side_effect = [
+            _tags_response(
+                ["2.19-rc1", "2.18-20260801", "2.10-20230901", "2.9-20230720", "2.14"],
+                next_url="https://api.github.com/page2",
+            ),
+            _tags_response(["2.18-20260824", "1.8-py3-20191203"]),
+        ]
+        # 2.18 > 2.10 > 2.9, the newest 2.18 release wins, and 2.19 has no
+        # release yet
+        assert utils.get_latest_scrapy_stack() == "scrapy:2.18-20260824"
+        assert mock_get.call_count == 2
+        assert mock_get.call_args[0][0] == "https://api.github.com/page2"
+
+    @patch("shub.utils.requests.get", autospec=True)
+    def test_get_latest_scrapy_stack_fallback(self, mock_get):
+        http_error = _tags_response([])
+        http_error.raise_for_status.side_effect = requests.HTTPError
+        unexpected_json = _tags_response([])
+        unexpected_json.json.return_value = {"message": "Not Found"}
+        for name, side_effect in (
+            ("offline", requests.ConnectionError),
+            ("HTTP error, e.g. rate limit", [http_error]),
+            ("unexpected JSON", [unexpected_json]),
+            ("no released stacks", [_tags_response(["2.19-rc1"])]),
+        ):
+            with self.subTest(name):
+                mock_get.side_effect = side_effect
+                assert utils.get_latest_scrapy_stack() == utils.FALLBACK_SCRAPY_STACK
+
+    def test_fetch_latest_scrapy_stack_online(self):
+        # Unlike the tests above, reach the actual GitHub API, so that
+        # upstream changes, e.g. in the format of its responses or of the
+        # stack tags, which would make get_latest_scrapy_stack() silently fall
+        # back to FALLBACK_SCRAPY_STACK, make this test fail.
+        try:
+            stack = utils._fetch_latest_scrapy_stack()
+        except (requests.ConnectionError, requests.Timeout) as e:
+            self.skipTest(f"Cannot reach GitHub: {e}")
+        except requests.HTTPError as e:
+            # Anonymous requests are rate-limited per IP address, which may be
+            # shared, e.g. by macOS CI runners
+            if e.response.headers.get("X-RateLimit-Remaining") == "0":
+                self.skipTest("GitHub API rate limit exceeded")
+            raise
+        # FALLBACK_SCRAPY_STACK was the latest stack when it was last bumped
+        assert _stack_release(stack) >= _stack_release(utils.FALLBACK_SCRAPY_STACK)
+
+    @patch("shub.utils.subprocess.call", autospec=True)
+    def test_download_from_pypi(self, mock_call):
+        def _call(*args, **kwargs):
+            utils.download_from_pypi(*args, **kwargs)
+            cmd = mock_call.call_args[0][0]
+            assert cmd[:3] == [sys.executable, "-m", "pip"]
+            return cmd[3:]
+
+        with pytest.raises(ValueError, match="either pkg or reqfile"):
+            utils.download_from_pypi("tmpdir")
+        with pytest.raises(ValueError, match="either pkg or reqfile"):
+            utils.download_from_pypi("tmpdir", pkg="shub", reqfile="req.txt")
+        assert not mock_call.called
+
+        pipargs = _call("tmpdir", pkg="shub", extra_args=["--x"])
+        assert pipargs[0] == "download"
+        for expected_arg in ["--no-binary=:all:", "--no-deps", "shub", "--x"]:
+            assert expected_arg in pipargs
+        # Make sure list contains '-d' followed by 'tmpdir'
+        assert pipargs.index("-d") + 1 == pipargs.index("tmpdir")
+
+        pipargs = _call("tmpdir", reqfile="req.txt")
+        assert pipargs.index("-r") + 1 == pipargs.index("req.txt")
+
+    def test_decompress_egg_files(self):
+        with self.runner.isolated_filesystem():
+            with zipfile.ZipFile("mypkg.whl", "w") as f:
+                f.writestr("mypkg/__init__.py", "")
+            utils.decompress_egg_files()
+            assert Path("mypkg/mypkg/__init__.py").is_file()
+
+    def test_decompress_egg_files_without_eggs(self):
+        with self.runner.isolated_filesystem(), pytest.raises(NotFoundException):
+            utils.decompress_egg_files()
+
+    def test_echo_short_log_if_deployed(self):
+        last_logs = ["last log line"]
+
+        deployed = True
+        for verbose, expected in ((True, ""), (False, "last log line\n")):
+            with patch("sys.stdout", new_callable=StringIO) as stdout:
+                utils.echo_short_log_if_deployed(deployed, last_logs, verbose=verbose)
+            assert expected == stdout.getvalue()
+
+        deployed = False
+        for verbose, expected in (
+            (True, ""),
+            (False, "Deploy log last 1 lines:\nlast log line\n"),
+        ):
+            with patch("sys.stdout", new_callable=StringIO) as stdout:
+                utils.echo_short_log_if_deployed(deployed, last_logs, verbose=verbose)
+            assert expected == stdout.getvalue()
+
+    def test_write_and_echo_logs(self):
+        last_logs = []
+        rsp = Mock()
+        rsp.iter_lines = Mock(return_value=iter([b"line1", b"line2"]))
+        with pytest.raises(RemoteErrorException):
+            utils.write_and_echo_logs(
+                keep_log=True, last_logs=last_logs, rsp=rsp, verbose=True
+            )
+        assert last_logs == [b"line1", b"line2"]
+        last_logs = []
+
+        rsp.iter_lines = Mock(
+            return_value=iter([b"line1", b'{"status":"ok","fieldK":"fieldV"}'])
+        )
+        utils.write_and_echo_logs(
+            keep_log=True, last_logs=last_logs, rsp=rsp, verbose=True
+        )
+        assert last_logs == [b"line1", b'{"status":"ok","fieldK":"fieldV"}']
+
+    def test_update_yaml_dict(self):
+        YAML_BEFORE = textwrap.dedent("""\
+            a:
+              unrelated: dict
+            b:
+              key1: val1
+              key2: val2
+        """)
+        DICT_EXPECTED = {
+            "a": {"unrelated": "dict"},
+            "b": {"key1": "newval1", "key2": "val2", "key3": "val3"},
+        }
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            with Path("conf.yml").open("w") as f:
+                f.write(YAML_BEFORE)
+            with utils.update_yaml_dict("conf.yml") as conf:
+                conf["b"]["key1"] = "newval1"
+                conf["b"]["key3"] = "val3"
+            with Path("conf.yml").open() as f:
+                assert yaml.safe_load(f) == DICT_EXPECTED
+                f.seek(0)
+                assert "key1: newval1" in f.read()
+
+    def test_update_yaml_dict_handles_file_errors(self):
+        with CliRunner().isolated_filesystem():
+            assert not Path("didnt_exist.yml").is_file()
+            with utils.update_yaml_dict("didnt_exist.yml"):
+                pass
+            assert Path("didnt_exist.yml").is_file()
+
+            Path("a_directory").mkdir()
+            with (
+                pytest.raises((IsADirectoryError, PermissionError)),
+                utils.update_yaml_dict("a_directory"),
+            ):
+                pass
+
+    @patch("shub.config.GLOBAL_SCRAPINGHUB_YML_PATH", "global.yml")
+    def test_update_yaml_dict_uses_global_by_default(self):
+        @click.command()
+        def call_update_yaml_dict():
+            with utils.update_yaml_dict():
+                pass
+
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            result = runner.invoke(call_update_yaml_dict)
+        assert "deprecated" in result.output
+
+    @patch("shub.utils.ScrapinghubClient")
+    def test_has_project_access(self, mock_client):
+        mock_client.return_value.projects.list.side_effect = ScrapinghubAPIError(
+            "Authentication failed"
+        )
+        with pytest.raises(InvalidAuthException):
+            utils.has_project_access(12345, "mock_endpoint", "abcdef")
+        mock_client.return_value.projects.list.side_effect = ScrapinghubAPIError(
+            "Random error"
+        )
+        with pytest.raises(RemoteErrorException):
+            utils.has_project_access(12345, "mock_endpoint", "abcdef")
+
+    def test_get_project_dir(self):
+        # OSX test work-around: /var/ is symlinked to /private/var/,
+        # and tempfile.mkdtemp() returns a non-absolute path while
+        # os.path.dirname function is resolving the absolute location.
+        # The workaround patches a path returned by utils.get_project_dir
+        def get_project_dir():
+            project_dir = utils.get_project_dir()
+            if project_dir.startswith("/private/"):
+                project_dir = project_dir[8:]
+            return project_dir
+
+        with CliRunner().isolated_filesystem() as basepath:
+            Path("a/b/c").mkdir(parents=True)
+            os.chdir("a/b/c")
+            with pytest.raises(NotFoundException):
+                get_project_dir()
+            Path(basepath, "Dockerfile").touch()
+            assert get_project_dir() == basepath
+            # scrapy.cfg takes precedence over Dockerfile
+            Path(basepath, "a", "scrapy.cfg").touch()
+            assert get_project_dir() == str(Path(basepath, "a"))
+            # scrapinghub.yml takes precedence over both
+            Path(basepath, "a", "b", "scrapinghub.yml").touch()
+            assert get_project_dir() == str(Path(basepath, "a", "b"))
+
+
+class OnboardingWizardTestCase(unittest.TestCase):
+    def setUp(self):
+        self.runner = CliRunner()
+        self.has_project_access = True
+        patcher = patch("shub.utils.get_latest_scrapy_stack", return_value=LATEST_STACK)
+        self.get_latest_scrapy_stack = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @patch("shub.utils.has_project_access")
+    def _test_wizard(
+        self,
+        mock_project_access,
+        conf=None,
+        target="default",
+        image=None,
+        sh_yml=None,
+        scrapy_cfg=True,
+        dockerfile=False,
+        **kwargs,
+    ):
+        if not conf:
+            conf = ShubConfig()
+            conf.apikeys = {"default": "abcdef"}
+        mock_project_access.return_value = self.has_project_access
+
+        @click.command()
+        def call_wizard():
+            utils.create_scrapinghub_yml_wizard(conf, target=target, image=image)
+
+        with self.runner.isolated_filesystem():
+            if scrapy_cfg:
+                Path("scrapy.cfg").touch()
+            if dockerfile:
+                Path("Dockerfile").touch()
+            if sh_yml:
+                with Path("scrapinghub.yml").open("w") as f:
+                    f.write(sh_yml)
+                conf.load_file("scrapinghub.yml")
+            result = self.runner.invoke(call_wizard, **kwargs)
+            if Path("scrapinghub.yml").exists():
+                with Path("scrapinghub.yml").open() as f:
+                    sh_yml = yaml.safe_load(f.read())
+            else:
+                sh_yml = None
+            return result, conf, sh_yml
+
+    def test_outside_of_project(self):
+        result, _, sh_yml = self._test_wizard(scrapy_cfg=False)
+        assert result.exit_code == NotFoundException.exit_code
+        assert sh_yml is None
+
+    def test_not_logged_in(self):
+        conf = ShubConfig()
+        result, _, sh_yml = self._test_wizard(conf=conf)
+        assert result.exit_code == MissingAuthException.exit_code
+        assert sh_yml is None
+
+    def test_scrapy_project(self):
+        result, conf, sh_yml = self._test_wizard(input="12345\n")
+        assert result.exit_code == 0
+        assert conf.projects == {"default": 12345}
+        assert conf.stacks == {"default": LATEST_STACK}
+        assert sh_yml == {
+            "project": 12345,
+            "stack": LATEST_STACK,
+        }
+        assert LATEST_STACK in result.output
+        self.get_latest_scrapy_stack.assert_called_once_with()
+
+    def test_custom_project(self):
+        result, conf, sh_yml = self._test_wizard(
+            scrapy_cfg=False, dockerfile=True, input="12345\n\n"
+        )
+        assert result.exit_code == 0
+        assert conf.projects == {"default": 12345}
+        assert conf.images == {"default": True}
+        assert sh_yml == {"project": 12345, "image": True}
+        self.get_latest_scrapy_stack.assert_not_called()
+
+    def test_custom_repository(self):
+        result, conf, sh_yml = self._test_wizard(
+            scrapy_cfg=False, dockerfile=True, input="12345\nrepo\n"
+        )
+        assert result.exit_code == 0
+        assert conf.images == {"default": "repo"}
+        assert sh_yml == {"project": 12345, "image": "repo"}
+
+    def test_ambiguous_project_not_custom(self):
+        result, conf, sh_yml = self._test_wizard(
+            scrapy_cfg=True, dockerfile=True, input="12345\nn\n"
+        )
+        assert result.exit_code == 0
+        assert conf.projects == {"default": 12345}
+        assert not conf.images
+        assert sh_yml == {
+            "project": 12345,
+            "stack": LATEST_STACK,
+        }
+
+    def test_ambiguous_project_custom(self):
+        result, conf, sh_yml = self._test_wizard(
+            scrapy_cfg=True, dockerfile=True, input="12345\n\n\n"
+        )
+        assert result.exit_code == 0
+        assert conf.projects == {"default": 12345}
+        assert conf.images == {"default": True}
+        assert sh_yml == {"project": 12345, "image": True}
+
+    def test_never_ask_for_repository_when_image_false(self):
+        result, conf, _ = self._test_wizard(
+            image=False, scrapy_cfg=False, dockerfile=True, input="12345\n"
+        )
+        assert result.exit_code == 0
+        assert "repository" not in result.output
+        assert not conf.images
+
+    def test_always_ask_for_repository_when_image_true(self):
+        result, conf, sh_yml = self._test_wizard(image=True, input="12345\nrepo\n")
+        assert result.exit_code == 0
+        assert conf.images == {"default": "repo"}
+        assert sh_yml == {"project": 12345, "image": "repo"}
+
+    def test_skip_on_existing_scrapinghub_yml_and_not_image(self):
+        original_sh_yml = "project: 12345\n"
+        result, conf, sh_yml = self._test_wizard(sh_yml=original_sh_yml)
+        assert result.exit_code == 0
+        assert not result.output
+        assert not conf.images
+        assert not conf.stacks
+        assert sh_yml == {"project": 12345}
+        self.get_latest_scrapy_stack.assert_not_called()
+
+    def test_add_image_for_existing_default_target(self):
+        original_sh_yml = "projects:\n  default: 12345\n  prod: 33333\n"
+        result, conf, sh_yml = self._test_wizard(
+            image=True, sh_yml=original_sh_yml, input="\n"
+        )
+        assert result.exit_code == 0
+        assert conf.images == {"default": True}
+        assert sh_yml == {"projects": {"default": 12345, "prod": 33333}, "image": True}
+
+    def test_add_image_for_existing_nondefault_target(self):
+        original_sh_yml = "projects:\n  default: 12345\n  prod: 33333\n"
+        result, conf, sh_yml = self._test_wizard(
+            target="prod", image=True, sh_yml=original_sh_yml, input="\n"
+        )
+        assert result.exit_code == 0
+        assert not conf.images
+        assert sh_yml == {
+            "projects": {
+                "default": 12345,
+                "prod": {
+                    "id": 33333,
+                    "image": True,
+                },
+            },
+        }
+
+    def test_skip_for_already_defined_default_image(self):
+        original_sh_yml = "project: 12345\nimage: true\n"
+        result, _conf, _sh_yml = self._test_wizard(image=True, sh_yml=original_sh_yml)
+        assert result.exit_code == 0
+        assert not result.output
+
+    def test_skip_for_already_defined_nondefault_image(self):
+        original_sh_yml = textwrap.dedent("""\
+            projects:
+              default: 12345
+              prod:
+                id: 33333
+                image: true\
+            """)
+        result, _conf, _sh_yml = self._test_wizard(
+            target="prod", image=True, sh_yml=original_sh_yml
+        )
+        assert result.exit_code == 0
+        assert not result.output
+
+    def test_scrapy_project_with_numeric_target(self):
+        result, conf, sh_yml = self._test_wizard(target="12345")
+        assert result.exit_code == 0
+        assert conf.projects == {"default": 12345}
+        assert sh_yml == {
+            "project": 12345,
+            "stack": LATEST_STACK,
+        }
+
+    def test_custom_project_with_numeric_target(self):
+        result, conf, sh_yml = self._test_wizard(
+            target="12345", scrapy_cfg=False, dockerfile=True, input="repo\n"
+        )
+        assert result.exit_code == 0
+        assert conf.projects == {"default": 12345}
+        assert conf.images == {"default": "repo"}
+        assert sh_yml == {"project": 12345, "image": "repo"}
+
+    def test_dont_leak_global_config(self):
+        conf = ShubConfig()
+        conf.projects = {"prod": 33333}
+        conf.apikeys = {"default": "abc"}
+        result, conf, sh_yml = self._test_wizard(conf=conf, input="12345\n")
+        assert result.exit_code == 0
+        assert conf.projects == {"default": 12345, "prod": 33333}
+        assert conf.apikeys == {"default": "abc"}
+        assert sh_yml == {
+            "project": 12345,
+            "stack": LATEST_STACK,
+        }
+
+    def test_dont_leak_global_config_on_image(self):
+        conf = ShubConfig()
+        conf.projects = {"prod": 33333}
+        conf.apikeys = {"default": "abc"}
+        result, conf, sh_yml = self._test_wizard(
+            conf=conf, scrapy_cfg=False, dockerfile=True, input="12345\nrepo\n"
+        )
+        assert result.exit_code == 0
+        assert conf.projects == {"default": 12345, "prod": 33333}
+        assert conf.apikeys == {"default": "abc"}
+        assert conf.images == {"default": "repo"}
+        assert sh_yml == {"project": 12345, "image": "repo"}
+
+    def test_dont_set_stack_for_globally_defined_project(self):
+        conf = ShubConfig()
+        conf.projects = {"default": 12345}
+        conf.apikeys = {"default": "abc"}
+        result, conf, sh_yml = self._test_wizard(conf=conf)
+        assert result.exit_code == 0
+        assert not conf.stacks
+        assert not sh_yml
+        self.get_latest_scrapy_stack.assert_not_called()
+
+    def test_dont_override_global_default_stack(self):
+        conf = ShubConfig()
+        conf.apikeys = {"default": "abc"}
+        conf.stacks = {"default": "scrapy:2.11"}
+        result, conf, sh_yml = self._test_wizard(conf=conf, input="12345\n")
+        assert result.exit_code == 0
+        assert conf.stacks == {"default": "scrapy:2.11"}
+        assert sh_yml == {"project": 12345}
+        self.get_latest_scrapy_stack.assert_not_called()
+
+    def test_dont_set_stack_with_global_default_image(self):
+        conf = ShubConfig()
+        conf.apikeys = {"default": "abc"}
+        conf.images = {"default": True}
+        result, conf, sh_yml = self._test_wizard(conf=conf, input="12345\n")
+        assert result.exit_code == 0
+        assert not conf.stacks
+        assert sh_yml == {"project": 12345}
+        self.get_latest_scrapy_stack.assert_not_called()

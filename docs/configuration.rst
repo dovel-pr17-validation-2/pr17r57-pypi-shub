@@ -1,0 +1,296 @@
+.. _configuration:
+
+=============
+Configuration
+=============
+
+Where to configure shub
+-----------------------
+
+shub is configured via two YAML files:
+
+* ``~/.scrapinghub.yml`` -- this file contains global configuration like
+  your API key. It is automatically created in your home directory when you run
+  ``shub login``. You can also change the default location with an environment
+  variable, check an appropriate section below.
+* ``scrapinghub.yml`` -- this file contains local configuration like the
+  project ID or the location of your requirements file. It is automatically
+  created in your project directory when you run ``shub deploy`` for the first
+  time.
+
+All configuration options listed below can be used in both of these
+configuration files.  In case they overlap, the local configuration file will
+always take precedence over the global one.
+
+
+Defining target projects
+------------------------
+
+A very basic ``scrapinghub.yml``, as generated when you first run ``shub
+deploy``, could look like this:
+
+.. parsed-literal::
+
+    project: 12345
+    stack: |latest-scrapy-stack|
+
+This tells shub to deploy to the Scrapy Cloud project ``12345`` when you run
+``shub deploy``, using the latest `Scrapy Cloud stack`_ (see
+:ref:`choose-custom-stack`).  Often, you will have multiple projects on Scrapy
+Cloud, e.g. one for development and one for production. For these cases, you
+can replace the ``project`` option with a ``projects`` dictionary::
+
+    projects:
+      default: 12345
+      prod: 33333
+
+shub will now deploy to project ``12345`` when you run ``shub deploy``, and
+deploy to project ``33333`` when you run ``shub deploy prod``.
+
+.. _configuration-options:
+
+The configuration options
+-------------------------
+
+A deployed project contains more than your Scrapy code. Among other things, it
+has a version tag, and often has additional package requirements or is bound to
+a specific Scrapy version. All of these can be configured in
+``scrapinghub.yml``.
+
+Sometimes the requirements may be different for different target projects, e.g.
+because you want to run your development project on Scrapy 1.3 but use Scrapy
+1.0 for your production project. For these cases some options can be configured
+either *globally* or *project-specific*.
+
+A *global* configuration option serves as default for all projects. E.g., to
+set ``scrapy:1.3-py3`` as default `Scrapy Cloud stack`_, use::
+
+    projects:
+      default: 12345
+      prod: 33333
+
+    stack: scrapy:1.3-py3
+
+If you wish to use the stack *only* for project ``12345``, expand its entry in
+``projects`` as follows::
+
+    projects:
+      default:
+        id: 12345
+        stack: scrapy:1.3-py3
+      prod: 33333
+
+The following is a list of all available configuration options:
+
+================  ============================================  ===============
+Option            Description                                   Scope
+================  ============================================  ===============
+``requirements``  Path to the project's requirements file, and  global default
+                  to any additional eggs that should be         and project-\
+                  deployed to Scrapy Cloud. See                 specific
+                  :ref:`deploying-dependencies`.
+``stack``         `Scrapy Cloud stack`_ to use (this is the     global default
+                  environment that your project will run in,    and project-\
+                  e.g. the Scrapy version that will be used).   specific
+``image``         Whether to use a custom Docker image on       global default
+                  deploy. See :ref:`deploy-custom-image`.       and project-\
+                                                                specific
+``dockerfile``    Path to the Dockerfile to build the custom    project-\
+                  Docker image from. Defaults to                specific
+                  :file:`Dockerfile`.
+``version``       Version tag to use when deploying. This can   global only
+                  be an arbitrary string or one of the magic
+                  keywords ``AUTO`` (default), ``GIT``, or
+                  ``HG``. By default, ``shub`` will
+                  auto-detect your version control system and
+                  use its branch/commit ID as version.
+``apikey``        API key to use for deployments. You will      global only
+                  typically not have to touch this setting as
+                  it will be configured inside
+                  ``~/.scrapinghub.yml`` in your home
+                  directory, via ``shub login``.
+================  ============================================  ===============
+
+.. _`Scrapy Cloud stack`: https://helpdesk.scrapinghub.com/support/solutions/articles/22000200402-scrapy-cloud-stacks
+
+.. _configuration-environment:
+
+Configuration via environment variables
+---------------------------------------
+
+Your Scrapinghub API key can be set as an environment variable, it could
+be useful for noninteractive deploys (e.g. for CI workflow).
+
+On Linux-based systems::
+
+    SHUB_APIKEY=0bbf4f0f691e0d9378ae00ca7bcf7f0c
+
+On Windows::
+
+    SET SHUB_APIKEY=0bbf4f0f691e0d9378ae00ca7bcf7f0c
+
+Instead of exporting the variable yourself, you can store it in a ``.env``
+file and let ``shub`` load it:
+
+.. code-block:: bash
+    :caption: :file:`.env`
+
+    SHUB_APIKEY=0bbf4f0f691e0d9378ae00ca7bcf7f0c
+
+By default ``shub`` reads the nearest ``.env`` file, looking in the current
+directory and then walking up through its parent directories. Use the
+``--dotenv-path`` option to point it at a different file::
+
+    shub --dotenv-path /path/to/myenv deploy
+
+Only the ``SHUB_APIKEY`` variable is read from the file; any other variables
+are ignored. A ``SHUB_APIKEY`` already set in the environment takes precedence
+over the value in the file.
+
+This ``.env`` lookup is not limited to the ``shub`` command: it is also
+performed by ``shub.config.load_shub_config()``, so code that uses shub as a
+library (instead of invoking the CLI) picks up ``SHUB_APIKEY`` from the
+nearest ``.env`` file too. Pass ``load_env=False`` to ``load_shub_config()``
+to skip both the environment variable and the ``.env`` file lookup.
+
+You can also parametrize global ``scrapinghub.yml`` file location with
+``SHUB_GLOBAL_CONFIG`` environment variable (default ``~/.scrapinghub.yml``).
+
+When working with custom Docker images, please be aware that the tool relies
+on a set of standard ``DOCKER_`` prefixed environment variables:
+
+DOCKER_HOST
+    The URL or Unix socket path used to connect to the Docker API.
+
+DOCKER_API_VERSION
+    The version of the Docker API running on the host. Defaults to the
+    latest version of the API supported by docker-py.
+
+DOCKER_CERT_PATH
+    Specify a path to the directory containing the client certificate,
+    client key and CA certificate.
+
+DOCKER_TLS_VERIFY
+    Enables securing the connection to the API by using TLS and verifying
+    the authenticity of the Docker Host.
+
+
+Example configurations
+----------------------
+
+Custom requirements file and fixed version information::
+
+    project: 12345
+    requirements:
+      file: requirements_scrapinghub.txt
+    version: 0.9.9
+
+Custom Scrapy Cloud stack, requirements file and additional private
+dependencies::
+
+    project: 12345
+    stack: scrapy:1.1
+    requirements:
+      file: requirements.txt
+      eggs:
+        - privatelib.egg
+        - path/to/otherlib.egg
+
+Using the latest Scrapy 1.3 stack in staging and development, but pinning the
+production stack to a specific release::
+
+    projects:
+      default: 12345
+      staging: 33333
+      prod:
+        id: 44444
+        stack: scrapy:1.3-py3-20170322
+
+    stack: scrapy:1.3-py3
+
+Using a custom Docker image::
+
+    projects:
+      default: 12345
+      prod: 33333
+
+    image: true
+
+Using a custom Docker image only for the development project::
+
+    projects:
+      default:
+        id: 12345
+        image: true
+      prod: 33333
+
+Using a custom Docker image in staging and development, but a Scrapy Cloud
+stack in production::
+
+    projects:
+      default: 12345
+      staging: 33333
+      prod:
+        id: 44444
+        image: false
+        stack: scrapy:1.3-py3-20170322
+
+    image: true
+
+Setting the API key used for deploying::
+
+    project: 12345
+    apikey: 0bbf4f0f691e0d9378ae00ca7bcf7f0c
+
+
+Advanced use cases
+------------------
+
+It is possible to configure multiple API keys::
+
+    projects:
+      default: 123
+      otheruser: someoneelse/123
+
+    apikeys:
+      default: 0bbf4f0f691e0d9378ae00ca7bcf7f0c
+      someoneelse: a1aeecc4cd52744730b1ea6cd3e8412a
+
+as well as different API endpoints::
+
+    projects:
+      dev: vagrant/3
+
+    endpoints:
+      vagrant: http://vagrant:3333/api/
+
+    apikeys:
+      default: 0bbf4f0f691e0d9378ae00ca7bcf7f0c
+      vagrant: a1aeecc4cd52744730b1ea6cd3e8412a
+
+API keys can also be keyed by endpoint URL, which takes precedence over the
+endpoint name unless a project sets ``apikey``. Running ``shub login`` in a
+project whose ``scrapinghub.yml`` sets a different default endpoint than
+:file:`~/.scrapinghub.yml` saves the API key to :file:`~/.scrapinghub.yml`
+this way::
+
+    apikeys:
+      default: 0bbf4f0f691e0d9378ae00ca7bcf7f0c
+      https://example.com/api/: a1aeecc4cd52744730b1ea6cd3e8412a
+
+Global and project-specific requirements. ``requirements.txt`` is used for projects ``prod`` and ``some``, ``requirements-dev.txt`` and eggs for ``dev``::
+
+  projects:
+    prod: 12345
+    dev:
+        id: 345
+        requirements:
+            file: requirements-dev.txt
+            eggs:
+            - ./egg1.egg
+            - ./egg2.egg
+    some: 567
+  requirements:
+    file: requirements.txt
+  stacks:
+    default: "scrapy:2.8"

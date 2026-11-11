@@ -1,0 +1,786 @@
+import os
+import shutil
+import tempfile
+import textwrap
+import unittest
+from io import StringIO
+from pathlib import Path
+from unittest import mock
+
+import pytest
+import yaml
+from click.testing import CliRunner
+from yaml import CLoader as Loader
+
+from shub.config import (
+    SH_IMAGES_REPOSITORY,
+    ShubConfig,
+    Target,
+    get_target,
+    get_target_conf,
+    get_version,
+    load_shub_config,
+)
+from shub.exceptions import (
+    BadConfigException,
+    BadParameterException,
+    ConfigParseException,
+    MissingAuthException,
+    NotFoundException,
+)
+
+VALID_YAML_CFG = """
+    projects:
+        shproj: 123
+        externalproj: external/123
+        notmeproj:
+            id: 234
+            apikey: otheruser
+        advanced_prod:
+            id: 456
+            stack: hworker:v1.0.0
+        advanced_dev:
+            id: 457
+            stack: dev
+        some:
+            id: 345
+            requirements:
+                file: requirements-dev.txt
+                eggs:
+                - ./egg3.egg
+                - ./egg4.egg
+    endpoints:
+        external: ext_endpoint
+    apikeys:
+        default: key
+        otheruser: otherkey
+    stacks:
+        dev: scrapy:v1.1
+    images:
+        dev: registry/user/project
+        prod: user/project
+    requirements:
+        eggs:
+          - ./egg1.egg
+          - ./egg2.egg
+        file: requirements.txt
+    version: 1.0
+"""
+
+
+def _project_dict(proj_id, endpoint="default", extra=None):
+    projd = {
+        "id": proj_id,
+        "endpoint": endpoint,
+        "apikey": endpoint,
+    }
+    projd.update(extra or {})
+    return projd
+
+
+def _target(
+    project_id,
+    endpoint=None,
+    apikey=None,
+    stack=None,
+    image=None,
+    requirements_file="requirements.txt",
+    version="1.0",
+    eggs=None,
+):
+    if eggs is None:
+        eggs = ["./egg1.egg", "./egg2.egg"]
+    return Target(
+        project_id=project_id,
+        endpoint=endpoint or ShubConfig.DEFAULT_ENDPOINT,
+        apikey=apikey,
+        stack=stack,
+        image=image,
+        requirements_file=requirements_file,
+        version=version,
+        eggs=eggs,
+    )
+
+
+class ShubConfigTest(unittest.TestCase):
+    def _get_conf_with_yml(self, yml):
+        conf = ShubConfig()
+        conf.load(StringIO(textwrap.dedent(yml)))
+        return conf
+
+    def setUp(self):
+        self.conf = self._get_conf_with_yml(VALID_YAML_CFG)
+
+    def test_init_sets_default(self):
+        conf = ShubConfig()
+        assert "default" in conf.endpoints
+        assert conf.version == "AUTO"
+
+    def test_load(self):
+        projects = {
+            "shproj": 123,
+            "externalproj": "external/123",
+            "notmeproj": {
+                "id": 234,
+                "apikey": "otheruser",
+            },
+            "advanced_prod": {
+                "id": 456,
+                "stack": "hworker:v1.0.0",
+            },
+            "advanced_dev": {"id": 457, "stack": "dev"},
+            "some": {
+                "id": 345,
+                "requirements": {
+                    "file": "requirements-dev.txt",
+                    "eggs": ["./egg3.egg", "./egg4.egg"],
+                },
+            },
+        }
+        assert projects == self.conf.projects
+        endpoints = {"external": "ext_endpoint"}
+        assert endpoints.items() <= self.conf.endpoints.items()
+        apikeys = {"default": "key", "otheruser": "otherkey"}
+        assert apikeys == self.conf.apikeys
+        stacks = {"dev": "scrapy:v1.1"}
+        assert stacks == self.conf.stacks
+        images = {"dev": "registry/user/project", "prod": "user/project"}
+        assert images == self.conf.images
+        assert "requirements.txt" == self.conf.requirements_file
+
+    def test_load_partial(self):
+        yml = """
+            endpoints:
+                external: ext_endpoint
+            extra:
+                not related to ShubConfig
+        """
+        conf = self._get_conf_with_yml(yml)
+        endpoints = {"external": "ext_endpoint"}
+        assert endpoints.items() <= conf.endpoints.items()
+        assert conf.projects == {}
+        assert conf.apikeys == {}
+        assert conf.images == {}
+        # Assert no exception raised on empty file
+        conf = self._get_conf_with_yml("")
+
+    def test_load_shortcuts(self):
+        yml = """
+            project: 111
+            stack: awesome_stack
+            apikey: awesome_key
+            endpoint: awesome_endpoint
+            image: awesome_image
+        """
+        conf = self._get_conf_with_yml(yml)
+        assert conf.projects["default"] == 111
+        assert conf.stacks["default"] == "awesome_stack"
+        assert conf.apikeys["default"] == "awesome_key"
+        assert conf.endpoints["default"] == "awesome_endpoint"
+        assert conf.images["default"] == "awesome_image"
+        assert conf.get_target_conf("default").stack == "awesome_stack"
+
+    def test_load_shortcut_mixed(self):
+        # Weird, but allowed
+        yml = """
+            stacks:
+                dev: dev_stack
+            stack: prod_stack
+        """
+        assert (
+            self._get_conf_with_yml(yml).stacks.items()
+            <= {"default": "prod_stack", "dev": "dev_stack"}.items()
+        )
+
+    def test_load_shortcut_conflict(self):
+        outer_yml = """
+            project: 111
+            stacks:
+                default: outer
+        """
+        inner_yml = """
+            stack: inner
+        """
+        conflicting_yml = """
+            stacks:
+                default: A
+            stack: B
+        """
+        # It is allowed to override a default option via shortcut if it is from
+        # a previously loaded file
+        self.conf.load(outer_yml)
+        self.conf.load(inner_yml)
+        # But not to specify both stacks: default and stack
+        with pytest.raises(BadConfigException):
+            self.conf.load(conflicting_yml)
+
+    def test_load_malformed(self):
+        # Invalid YAML
+        yml = """
+            endpoints
+                external: ext_endpoint
+            apikeys:
+                default: key
+        """
+        with pytest.raises(ConfigParseException):
+            self._get_conf_with_yml(yml)
+        # Valid YAML but not dictionary-like
+        yml = """
+            endpoints
+                external: ext_endpoint
+        """
+        with pytest.raises(ConfigParseException):
+            self._get_conf_with_yml(yml)
+
+    def test_load_file(self):
+        tmpdir = tempfile.mkdtemp()
+        tmpfilepath = Path(tmpdir, "scrapinghub.yml")
+        with tmpfilepath.open("w") as f:
+            f.write(
+                textwrap.dedent(
+                    """
+                apikeys:
+                    external: ext_endpoint
+                """
+                )
+            )
+        conf = ShubConfig()
+        conf.load_file(tmpfilepath)
+        shutil.rmtree(tmpdir)
+        assert {"external": "ext_endpoint"} == conf.apikeys
+
+    def test_deprecated_reqfile_syntax(self):
+        assert self.conf.requirements_file == "requirements.txt"
+        self.conf.load("""
+            requirements_file: oldstyle.txt
+            """)
+        assert self.conf.requirements_file == "oldstyle.txt"
+        self.conf.load("""
+            requirements:
+                file: newstyle.txt
+            requirements_file: oldstyle.txt
+            """)
+        assert self.conf.requirements_file == "newstyle.txt"
+
+    def test_save(self):
+        with CliRunner().isolated_filesystem():
+            self.conf.save("conf.yml")
+            loaded_conf = ShubConfig()
+            loaded_conf.load_file("conf.yml")
+            for option in [
+                "projects",
+                "endpoints",
+                "apikeys",
+                "version",
+                "stacks",
+                "requirements_file",
+                "eggs",
+                "images",
+            ]:
+                assert getattr(self.conf, option) == getattr(loaded_conf, option)
+
+    def test_save_partial(self):
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            conf = self._get_conf_with_yml("""
+                projects:
+                    default: 123
+                """)
+            conf.save("conf.yml")
+            with Path("conf.yml").open() as f:
+                assert yaml.load(f, Loader=Loader) == {"project": 123}
+
+            conf = self._get_conf_with_yml("""
+                projects:
+                    default: 123
+                requirements:
+                    file: reqs.txt
+                """)
+            conf.save("conf.yml")
+            with Path("conf.yml").open() as f:
+                assert yaml.load(f, Loader=Loader) == {
+                    "project": 123,
+                    "requirements": {"file": "reqs.txt"},
+                }
+
+    def test_save_skip_defaults(self):
+        conf = ShubConfig()
+        with CliRunner().isolated_filesystem():
+            conf.save("conf.yml")
+            with Path("conf.yml").open() as f:
+                assert yaml.load(f, Loader=Loader) is None
+
+    def test_save_shortcut(self):
+        conf = ShubConfig()
+        conf.endpoints["ext"] = "external"
+        conf.stacks["default"] = "my_stack"
+        expected_yml_dict = {
+            # No shortcut
+            "endpoints": {
+                "default": ShubConfig.DEFAULT_ENDPOINT,
+                "ext": "external",
+            },
+            # Shortcut
+            "stack": "my_stack",
+        }
+        with CliRunner().isolated_filesystem():
+            conf.save("conf.yml")
+            with Path("conf.yml").open() as f:
+                assert yaml.load(f, Loader=Loader) == expected_yml_dict
+
+    def test_save_shortcut_updated(self):
+        OLD_YML = """\
+        projects:
+            default: 12345
+            prod: 33333
+        """
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            with Path("scrapinghub.yml").open("w") as f:
+                f.write(textwrap.dedent(OLD_YML))
+            conf = ShubConfig()
+            conf.load_file("scrapinghub.yml")
+            del conf.projects["prod"]
+            print(conf.projects)
+            conf.save("scrapinghub.yml")
+            with Path("scrapinghub.yml").open() as f:
+                new_yml = yaml.safe_load(f)
+            # Should not contain 'projects'
+            assert new_yml == {"project": 12345}
+
+            conf = ShubConfig()
+            conf.load_file("scrapinghub.yml")
+            # Should also work in reverse
+            conf.projects["prod"] = 33333
+            conf.save("scrapinghub.yml")
+            with Path("scrapinghub.yml").open() as f:
+                new_yml = yaml.safe_load(f)
+            # Should not contain 'project' singleton
+            assert new_yml == {"projects": {"default": 12345, "prod": 33333}}
+
+            # Make sure it is readable again
+            ShubConfig().load_file("scrapinghub.yml")
+
+    def test_save_partial_options(self):
+        OLD_YML = """\
+        projects:
+            default: 12345
+            prod: 33333
+        stack: custom-stack
+        """
+        with CliRunner().isolated_filesystem():
+            with Path("conf.yml").open("w") as f:
+                f.write(textwrap.dedent(OLD_YML))
+            conf = ShubConfig()
+            conf.load_file("conf.yml")
+            del conf.projects["prod"]
+            del conf.stacks["default"]
+            conf.save("conf.yml", options=["projects"])
+            with Path("conf.yml").open() as f:
+                assert yaml.load(f, Loader=Loader) == {
+                    "project": 12345,
+                    "stack": "custom-stack",
+                }
+            conf.save("conf.yml")
+            with Path("conf.yml").open() as f:
+                assert yaml.load(f, Loader=Loader) == {"project": 12345}
+
+    def test_normalized_projects(self):
+        expected_projects = {
+            "shproj": _project_dict(123),
+            "externalproj": _project_dict(123, "external"),
+            "notmeproj": _project_dict(234, extra={"apikey": "otheruser"}),
+            "advanced_prod": _project_dict(456, extra={"stack": "hworker:v1.0.0"}),
+            "advanced_dev": _project_dict(457, extra={"stack": "dev"}),
+            "some": _project_dict(
+                345,
+                extra={
+                    "requirements": {
+                        "file": "requirements-dev.txt",
+                        "eggs": ["./egg3.egg", "./egg4.egg"],
+                    }
+                },
+            ),
+        }
+        assert self.conf.normalized_projects == expected_projects
+
+    def test_get_project(self):
+        assert self.conf.get_project(123) == self.conf.get_project("shproj")
+        assert self.conf.get_project(456) == self.conf.get_project("advanced_prod")
+        assert self.conf.get_project(456) == self.conf.get_project("456")
+        assert self.conf.get_project("externalproj") == self.conf.get_project(
+            "external/123"
+        )
+
+    def test_get_image(self):
+        self.conf.load("""
+            projects:
+                default: 123
+                stacks-explicit:
+                    id: 322
+                    image: false
+                devel:
+                    id: 456
+                    image: true
+                sh-alias:
+                    id: 654
+                    image: scrapinghub
+                custom:
+                    id: 789
+                    image: user/repo
+                deprecated: 987
+            image: true
+            images:
+                deprecated: old/style
+        """)
+        assert self.conf.get_image("default") == SH_IMAGES_REPOSITORY.format(
+            project=123
+        )
+        with pytest.raises(BadConfigException):
+            self.conf.get_image("stacks-explicit")
+        # check that aliases work as expected
+        assert self.conf.get_image("devel") == SH_IMAGES_REPOSITORY.format(project=456)
+        assert self.conf.get_image("sh-alias") == SH_IMAGES_REPOSITORY.format(
+            project=654
+        )
+        # check if custom image is respected
+        assert self.conf.get_image("custom") == "user/repo"
+        # check for backward compatibility
+        assert self.conf.get_image("deprecated") == "old/style"
+
+    def test_get_image_not_found(self):
+        self.conf.load("""
+            projects:
+                default: 123
+        """)
+        with pytest.raises(NotFoundException):
+            self.conf.get_image("default")
+
+    def test_get_image_mismatch_project(self):
+        self.conf.load("""
+            projects:
+                prod: 123
+                develop: 321
+                success: 456
+            images:
+                prod: images.scrapinghub.com/wrong-prefix/123
+                develop: images.scrapinghub.com/project/123
+                success: images.scrapinghub.com/project/456
+        """)
+        with pytest.raises(BadConfigException):
+            self.conf.get_image("prod")
+        with pytest.raises(BadConfigException):
+            self.conf.get_image("develop")
+        assert self.conf.get_image("success") == SH_IMAGES_REPOSITORY.format(
+            project=456
+        )
+
+    def test_get_image_ambigious_deprecated_images_section(self):
+        with pytest.raises(BadConfigException):
+            self.conf.load("""
+                projects:
+                    default:
+                        id: 123
+                    stacks:
+                        id: 322
+                        stack: scrapy:1.2
+                images:
+                    default: custom/image
+            """)
+        self.conf.load("""
+            projects:
+                default:
+                    id: 123
+                stacks:
+                    id: 322
+                    image: false
+                    stack: scrapy:1.2
+            image: custom/image
+        """)
+
+    def test_get_image_ambiguous_global_image_and_global_stack(self):
+        self.conf.load("""
+            project: 123
+            image: true
+            stack: scrapy:1.3
+        """)
+        with pytest.raises(BadConfigException, match=r"(?i)ambiguous"):
+            self.conf.get_image("default")
+
+    def test_get_image_ambiguous_global_image_and_project_stack(self):
+        self.conf.load("""
+            projects:
+              bad:
+                id: 123
+                stack: scrapy:1.3
+              good:
+                id: 456
+                image: false
+                stack: scrapy:1.3
+            image: true
+            """)
+        with pytest.raises(BadConfigException, match=r"(?i)ambiguous"):
+            self.conf.get_image("bad")
+        with pytest.raises(BadConfigException, match=r"(?i)disabled"):
+            self.conf.get_image("good")
+
+    def test_get_image_ambiguous_project_image_and_project_stack(self):
+        self.conf.load("""
+            projects:
+              default:
+                id: 123
+                image: true
+                stack: scrapy:1.3
+            """)
+        with pytest.raises(BadConfigException, match=r"(?i)ambiguous"):
+            self.conf.get_image("default")
+
+    def test_get_target_conf(self):
+        assert self.conf.get_target_conf("shproj", auth_required=False) == _target(
+            123, apikey="key"
+        )
+        assert self.conf.get_target_conf(
+            "shproj", auth_required=True
+        ) == self.conf.get_target_conf("shproj", auth_required=False)
+        with pytest.raises(MissingAuthException):
+            self.conf.get_target_conf("externalproj")
+        assert self.conf.get_target_conf(
+            "externalproj", auth_required=False
+        ) == _target(123, "ext_endpoint")
+        assert self.conf.get_target_conf("notmeproj") == _target(234, apikey="otherkey")
+        assert self.conf.get_target_conf("advanced_prod") == _target(
+            456, apikey="key", stack="hworker:v1.0.0"
+        )
+        assert self.conf.get_target_conf("advanced_dev") == _target(
+            457, apikey="key", stack="scrapy:v1.1"
+        )
+
+    def test_get_target_conf_custom_defaults(self):
+        self.conf.load("""
+            stacks:
+              default: custom_default
+        """)
+        assert self.conf.get_target_conf("shproj") == _target(
+            123, apikey="key", stack="custom_default"
+        )
+        assert self.conf.get_target_conf("advanced_prod") == _target(
+            456, apikey="key", stack="hworker:v1.0.0"
+        )
+
+    def test_get_target_conf_calls_get_project(self):
+        t = _target(456, apikey="key", stack="hworker:v1.0.0")
+        assert self.conf.get_target_conf("advanced_prod") == t
+        assert self.conf.get_target_conf(456) == t
+        assert self.conf.get_target_conf("456") == t
+        assert self.conf.get_target_conf("default/456") == t
+
+    def test_get_target_correct_requirements(self):
+        correct_reqs = {
+            "shproj": "requirements.txt",
+            "notmeproj": "requirements.txt",
+            "advanced_prod": "requirements.txt",
+            "advanced_dev": "requirements.txt",
+            "some": "requirements-dev.txt",
+        }
+        for name, reqs_file in correct_reqs.items():
+            target = self.conf.get_target_conf(name)
+            assert target.requirements_file == reqs_file
+
+    def test_get_target_correct_eggs(self):
+        correct_eggs = {
+            "shproj": ["./egg1.egg", "./egg2.egg"],
+            "notmeproj": ["./egg1.egg", "./egg2.egg"],
+            "advanced_prod": ["./egg1.egg", "./egg2.egg"],
+            "advanced_dev": ["./egg1.egg", "./egg2.egg"],
+            "some": ["./egg3.egg", "./egg4.egg"],
+        }
+        for name, eggs in correct_eggs.items():
+            target = self.conf.get_target_conf(name)
+            assert target.eggs == eggs
+
+    def test_get_undefined(self):
+        assert self.conf.get_target_conf("99") == _target(99, apikey="key")
+        assert self.conf.get_target_conf("external/99", auth_required=False) == _target(
+            99, "ext_endpoint", None
+        )
+        with pytest.raises(NotFoundException):
+            self.conf.get_target_conf("nonexisting_ep/33")
+
+    def test_get_invalid(self):
+        # Missing target and no default defined
+        with pytest.raises(BadParameterException):
+            self.conf.get_target_conf("default")
+        # Bad project ID on command line
+        with pytest.raises(BadParameterException):
+            self.conf.get_target_conf("99a")
+        # Bad project ID in scrapinghub.yml
+        conf = self._get_conf_with_yml(
+            """
+            projects:
+                invalid: 50a
+                invalid2: 123/external
+            """
+        )
+        with pytest.raises(BadConfigException):
+            conf.get_target_conf("invalid")
+        with pytest.raises(BadConfigException):
+            conf.get_target_conf("invalid2")
+
+    def test_apikey_always_str(self):
+        # API keys should always be strings, even if they contain only digits
+        self.conf.apikeys["default"] = 123
+        assert self.conf.get_target_conf("shproj") == _target(123, apikey="123")
+
+    def test_hidden_apikey(self):
+        self.conf.apikeys["default"] = 123
+        assert self.conf.get_target_conf("shproj").apikey.__repr__() == "123"
+        self.conf.apikeys["default"] = "apikey_string"
+        assert self.conf.get_target_conf("shproj").apikey.__repr__() == "apikeyXXXXXXX"
+
+    @mock.patch("shub.config.pwd_version", return_value="ver_AUTO")
+    @mock.patch("shub.config.pwd_git_version", return_value="ver_GIT")
+    @mock.patch("shub.config.pwd_hg_version", return_value="ver_HG")
+    def test_get_version(self, mock_hg, mock_git, mock_ver):
+        def _assert_version(version, expected):
+            self.conf.version = version
+            assert self.conf.get_version() == expected
+
+        _assert_version("GIT", "ver_GIT")
+        _assert_version("HG", "ver_HG")
+        _assert_version("somestring", "somestring")
+        _assert_version("", "ver_AUTO")
+        _assert_version("AUTO", "ver_AUTO")
+
+
+LOCAL_SCRAPINGHUB_YML = """
+    projects:
+        localextproj: external/123
+    endpoints:
+        external: local_ext_endpoint
+    apikeys:
+        external: key_ext
+"""
+
+
+class LoadShubConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.globalpath = self.tmpdir / ".scrapinghub.yml"
+        self.localpath = self.tmpdir / "scrapinghub.yml"
+        with self.globalpath.open("w") as f:
+            f.write(VALID_YAML_CFG)
+        with self.localpath.open("w") as f:
+            f.write(LOCAL_SCRAPINGHUB_YML)
+        self._old_dir = Path.cwd()
+        os.chdir(self.tmpdir)
+
+        patcher_gsyp = mock.patch(
+            "shub.config.GLOBAL_SCRAPINGHUB_YML_PATH", new=str(self.globalpath)
+        )
+        self.addCleanup(patcher_gsyp.stop)
+        patcher_gsyp.start()
+
+    def tearDown(self):
+        os.chdir(self._old_dir)
+        shutil.rmtree(self.tmpdir)
+
+    def test_scrapinghub_ymls_read(self):
+        conf = load_shub_config()
+        assert conf.get_apikey("shproj") == "key"
+        assert conf.get_endpoint("externalproj") == "local_ext_endpoint"
+        assert conf.get_apikey("externalproj") == "key_ext"
+        with pytest.raises(BadParameterException):
+            conf.get_project_id("ext2")
+
+    def test_local_scrapinghub_yml_in_parent_dir(self):
+        subsubdir = self.tmpdir / "sub" / "sub"
+        subsubdir.mkdir(parents=True)
+        os.chdir(subsubdir)
+        conf = load_shub_config()
+        assert conf.get_apikey("externalproj") == "key_ext"
+
+    def test_no_local_scrapinghub_yml(self):
+        self.localpath.unlink()
+        conf = load_shub_config()
+        assert conf.get_apikey("shproj") == "key"
+        with pytest.raises(BadParameterException):
+            conf.get_apikey("localextproj")
+
+    def test_no_global_scrapinghub_yml(self):
+        self.globalpath.unlink()
+        conf = load_shub_config()
+        with pytest.raises(BadParameterException):
+            conf.get_apikey("shproj")
+        assert conf.get_apikey("localextproj") == "key_ext"
+
+    def test_envvar_precedence(self):
+        _old_environ = dict(os.environ)
+        os.environ["SHUB_APIKEY"] = "key_env"
+        conf = load_shub_config()
+        assert conf.get_apikey("shproj") == "key_env"
+        os.environ.clear()
+        os.environ.update(_old_environ)
+
+
+class ConfigHelpersTest(unittest.TestCase):
+    @mock.patch("shub.config.load_shub_config")
+    def test_get_target_version(self, mock_lsh):
+        get_target("mytarget", auth_required=False)
+        get_target_conf("mytargetconf", auth_required=False)
+        get_version()
+        mock_lsh.return_value.get_target.assert_called_once_with(
+            "mytarget", auth_required=False
+        )
+        mock_lsh.return_value.get_target_conf.assert_called_once_with(
+            "mytargetconf", auth_required=False
+        )
+        mock_lsh.return_value.get_version.assert_called_once_with()
+
+
+def test_shub_apikey_env_overrides_local(tmp_path, monkeypatch):
+    yml = tmp_path / "scrapinghub.yml"
+    yml.write_text("""
+apikeys:
+  default: FILEKEY
+""")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SHUB_APIKEY", "ENVKEY")
+
+    conf = load_shub_config(load_global=False, load_local=True, load_env=True)
+    assert conf.apikeys["default"] == "ENVKEY"
+
+
+@pytest.fixture
+def endpoint_confs(tmp_path, monkeypatch):
+    global_yml = tmp_path / "global.yml"
+    global_yml.write_text("""
+apikeys:
+  default: ZYTEKEY
+  https://example.com/api/: EXAMPLEKEY
+  other: OTHERKEY
+""")
+    (tmp_path / "scrapinghub.yml").write_text("""
+projects:
+  default: 123
+  explicit:
+    id: 456
+    apikey: other
+endpoint: https://example.com/api/
+""")
+    monkeypatch.setattr("shub.config.GLOBAL_SCRAPINGHUB_YML_PATH", str(global_yml))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SHUB_APIKEY", raising=False)
+
+
+@pytest.mark.usefixtures("endpoint_confs")
+def test_apikey_by_endpoint_url():
+    conf = load_shub_config()
+    assert conf.get_target_conf("default").apikey == "EXAMPLEKEY"
+    assert conf.get_target_conf("explicit").apikey == "OTHERKEY"
+
+
+@pytest.mark.usefixtures("endpoint_confs")
+def test_shub_apikey_env_overrides_apikey_by_endpoint_url(monkeypatch):
+    monkeypatch.setenv("SHUB_APIKEY", "ENVKEY")
+    conf = load_shub_config()
+    assert conf.get_target_conf("default").apikey == "ENVKEY"

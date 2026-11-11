@@ -1,0 +1,110 @@
+=======
+Changes
+=======
+
+(unreleased)
+============
+
+-   ``shub deploy --build-egg`` is deprecated in favor of the new
+    ``shub build-egg`` command: ``shub build-egg FILENAME`` builds the
+    project's egg and writes it to ``FILENAME``, without deploying it. The
+    deprecated option keeps working, and now behaves like the new command. In
+    particular, it no longer requires a configured target and API key, and,
+    if the target uses a custom Docker image, it no longer uploads that image
+    instead of building an egg. As a consequence, the target argument is
+    ignored when ``--build-egg`` is used. Also, ``deploy_cmd()`` no longer
+    has a ``build_egg`` parameter.
+
+-   ``shub deploy`` now builds the egg from a copy of the working directory
+    that leaves out anything git considers ignored (e.g. via
+    ``.gitignore``), when run inside a git repository. This keeps build
+    artifacts, local secrets, and stray virtualenvs out of the deploy by
+    default. Uncommitted changes to tracked files, and new untracked files
+    that aren't gitignored, are still included. Projects that aren't inside
+    a git repository, or where ``git`` isn't available, keep the previous
+    behavior of deploying the working directory as-is.
+
+-   When ``shub deploy`` creates a new ``scrapinghub.yml`` for a project that
+    does not use a custom Docker image, it now sets ``stack`` to the latest
+    Scrapy stack released in the `scrapinghub-stack-scrapy
+    <https://github.com/scrapinghub/scrapinghub-stack-scrapy/tags>`__
+    repository, frozen to its release date (e.g. ``scrapy:2.18-20260824``).
+    If that repository cannot be reached, e.g. while offline, the latest stack
+    at the time of this release is used instead. Previously, no stack was set,
+    so Scrapy Cloud used its default stack, which can be much older. Existing
+    ``scrapinghub.yml`` files are not modified, and a default stack already
+    configured elsewhere (e.g. in ``~/.scrapinghub.yml``) is respected.
+
+-   New ``shub jobs`` command to list the latest jobs of a project or of a
+    spider, so that you can find a job key without opening the web interface.
+    It supports ``--limit``, ``--filter`` (by state, tag, or spider
+    argument), and ``--orderby``. It fails with an error, instead of listing
+    no jobs, if the project does not exist or your account cannot access it.
+
+2.18.1 (2026-07-08)
+===================
+
+-   ``shub.config.load_shub_config()`` now also reads ``SHUB_APIKEY`` from the
+    nearest ``.env`` file, not just the ``shub`` CLI. Previously this only
+    worked when invoking the ``shub`` command.
+
+2.18.0 (2026-06-19)
+===================
+
+-   Load the ``SHUB_APIKEY`` environment variable from a ``.env`` file via
+    `python-dotenv`. Use the new ``--dotenv-path`` option to point ``shub`` at
+    a file other than the default ``.env``.
+
+2.17.1 (2026-04-21)
+===================
+
+-   Prioritize the `SHUB_APIKEY` environment variable over the local
+    `scrapinghub.yml` configuration.
+
+-   Update references from "Scrapinghub" to "Zyte" in the scheduling
+    documentation.
+
+2.17.0 (2026-04-07)
+===================
+
+-   Drop support for Python 3.9.
+
+-   Made the documentation more LLM-friendly, with markdown versions of every
+    page and :file:`llms.txt` and :file:`llms-full.txt` files.
+
+2.16.0 (2025-11-05)
+===================
+
+-   Drop support for Python 3.6, 3.7 & 3.8.
+
+-   Add support for Python 3.13 & 3.14.
+
+-   Fix ``shub image upload`` documentation.
+
+-   Add support for current Poetry versions.
+
+-   Fix link to get apikey in ``shub login`` command.
+
+-   Modernize generated Dockerfile (``shub image init`` command).
+
+
+2.15.4 (2024-02-08)
+===================
+
+-   Support Docker server 25+.
+
+
+2.15.3 (2024-01-23)
+===================
+
+-   Fix ``shub image deploy`` failing on Python 3.8 and 3.9.
+
+
+2.15.2 (2024-01-17)
+===================
+
+-   Add support for Python 3.12.
+
+-   Remove remnants of Python 2 support.
+
+-   Start a changelog.
